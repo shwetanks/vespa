@@ -7,13 +7,15 @@
 #include <vespa/messagebus/tracelevel.h>
 #include <vespa/messagebus/emptyreply.h>
 #include <vespa/messagebus/errorcode.h>
-#include <vespa/vespalib/util/stringfmt.h>
 #include <vespa/fnet/channel.h>
 #include <vespa/fnet/frt/reflection.h>
+#include <vespa/vespalib/util/stringfmt.h>
+#include <vespa/vespalib/util/lambdatask.h>
 
 #include <vespa/vespalib/data/slime/cursor.h>
 
 using vespalib::make_string;
+using vespalib::makeLambdaTask;
 
 namespace mbus {
 
@@ -146,6 +148,11 @@ RPCSend::send(RoutingNode &recipient, const vespalib::Version &version,
 void
 RPCSend::RequestDone(FRT_RPCRequest *req)
 {
+    doRequestDone(req);
+}
+
+void
+RPCSend::doRequestDone(FRT_RPCRequest *req) {
     SendContext::UP ctx(static_cast<SendContext*>(req->GetContext()._value.VOIDP));
     const string &serviceName = static_cast<RPCServiceAddress&>(ctx->getRecipient().getServiceAddress()).getServiceName();
     Reply::UP reply;
@@ -213,6 +220,19 @@ RPCSend::decode(vespalib::stringref protocolName, const vespalib::Version & vers
 void
 RPCSend::handleReply(Reply::UP reply)
 {
+    const IProtocol * protocol = _net->getOwner().getProtocol(reply->getProtocol());
+    if (!protocol || protocol->requireSequencing()) {
+        doHandleReply(protocol, std::move(reply));
+    } else {
+        auto rejected = _net->getExecutor().execute(makeLambdaTask([this, protocol, reply = std::move(reply)]() mutable {
+            doHandleReply(protocol, std::move(reply));
+        }));
+        assert (!rejected);
+    }
+}
+
+void
+RPCSend::doHandleReply(const IProtocol * protocol, Reply::UP reply) {
     ReplyContext::UP ctx(static_cast<ReplyContext*>(reply->getContext().value.PTR));
     FRT_RPCRequest &req = ctx->getRequest();
     string version = ctx->getVersion().toString();
@@ -222,7 +242,7 @@ RPCSend::handleReply(Reply::UP reply)
     }
     Blob payload(0);
     if (reply->getType() != 0) {
-        payload = _net->getOwner().getProtocol(reply->getProtocol())->encode(ctx->getVersion(), *reply);
+        payload = protocol->encode(ctx->getVersion(), *reply);
         if (payload.size() == 0) {
             reply->addError(Error(ErrorCode::ENCODE_ERROR, "An error occured while encoding the reply, see log."));
         }
@@ -236,6 +256,12 @@ void
 RPCSend::invoke(FRT_RPCRequest *req)
 {
     req->Detach();
+    doRequest(req);
+}
+
+void
+RPCSend::doRequest(FRT_RPCRequest *req)
+{
     FRT_Values &args = *req->GetParams();
 
     std::unique_ptr<Params> params = toParams(args);

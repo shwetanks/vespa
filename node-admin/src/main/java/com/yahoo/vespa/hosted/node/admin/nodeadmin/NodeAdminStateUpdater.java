@@ -1,8 +1,10 @@
 // Copyright 2017 Yahoo Holdings. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
 package com.yahoo.vespa.hosted.node.admin.nodeadmin;
 
-import com.yahoo.component.AbstractComponent;
 import com.yahoo.concurrent.ThreadFactoryFactory;
+import com.yahoo.concurrent.classlock.ClassLock;
+import com.yahoo.concurrent.classlock.ClassLocking;
+import com.yahoo.concurrent.classlock.LockInterruptException;
 import com.yahoo.log.LogLevel;
 import com.yahoo.vespa.hosted.node.admin.ContainerNodeSpec;
 import com.yahoo.vespa.hosted.node.admin.maintenance.StorageMaintainer;
@@ -20,6 +22,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -36,7 +39,7 @@ import static com.yahoo.vespa.hosted.node.admin.nodeadmin.NodeAdminStateUpdater.
  *
  * @author dybis, stiankri
  */
-public class NodeAdminStateUpdater extends AbstractComponent {
+public class NodeAdminStateUpdater {
     static final Duration FREEZE_CONVERGENCE_TIMEOUT = Duration.ofMinutes(5);
 
     private final AtomicBoolean terminated = new AtomicBoolean(false);
@@ -49,34 +52,57 @@ public class NodeAdminStateUpdater extends AbstractComponent {
     private final Logger log = Logger.getLogger(NodeAdminStateUpdater.class.getName());
     private final ScheduledExecutorService specVerifierScheduler =
             Executors.newScheduledThreadPool(1, ThreadFactoryFactory.getDaemonThreadFactory("specverifier"));
-    private Thread loopThread;
+    private final Thread loopThread;
 
     private final NodeRepository nodeRepository;
+    private final Orchestrator orchestrator;
     private final NodeAdmin nodeAdmin;
     private final Clock clock;
-    private final Orchestrator orchestrator;
     private final String dockerHostHostName;
+    private final Duration nodeAdminConvergeStateInterval;
 
-    private long delaysBetweenEachTickMillis = 30_000;
+    private final ClassLocking classLocking;
+    private Optional<ClassLock> classLock;
     private Instant lastTick;
 
     public NodeAdminStateUpdater(
-            final NodeRepository nodeRepository,
-            final NodeAdmin nodeAdmin,
-            StorageMaintainer storageMaintainer,
-            Clock clock,
+            NodeRepository nodeRepository,
             Orchestrator orchestrator,
-            String dockerHostHostName) {
-        log.log(LogLevel.INFO, objectToString() + ": Creating object");
+            StorageMaintainer storageMaintainer,
+            NodeAdmin nodeAdmin,
+            String dockerHostHostName,
+            Clock clock,
+            Duration nodeAdminConvergeStateInterval,
+            ClassLocking classLocking) {
+        log.info(objectToString() + ": Creating object");
         this.nodeRepository = nodeRepository;
-        this.nodeAdmin = nodeAdmin;
-        this.clock = clock;
         this.orchestrator = orchestrator;
+        this.nodeAdmin = nodeAdmin;
         this.dockerHostHostName = dockerHostHostName;
+        this.clock = clock;
+        this.nodeAdminConvergeStateInterval = nodeAdminConvergeStateInterval;
+        this.classLocking = classLocking;
         this.lastTick = clock.instant();
 
-        specVerifierScheduler.scheduleWithFixedDelay(() ->
-                updateHardwareDivergence(storageMaintainer), 5, 60, TimeUnit.MINUTES);
+        this.loopThread = new Thread(() -> {
+            log.info(objectToString() + ": Acquiring lock");
+            try {
+                classLock = Optional.of(classLocking.lockWhile(NodeAdminStateUpdater.class, () -> !terminated.get()));
+            } catch (LockInterruptException e) {
+                classLock = Optional.empty();
+                return;
+            }
+
+            log.info(objectToString() + ": Starting threads and schedulers");
+            nodeAdmin.start();
+            specVerifierScheduler.scheduleWithFixedDelay(() ->
+                    updateHardwareDivergence(storageMaintainer), 5, 60, TimeUnit.MINUTES);
+
+            while (! terminated.get()) {
+                tick();
+            }
+        });
+        this.loopThread.setName("tick-NodeAdminStateUpdater");
     }
 
     private String objectToString() {
@@ -133,7 +159,8 @@ public class NodeAdminStateUpdater extends AbstractComponent {
         State wantedStateCopy;
         synchronized (monitor) {
             while (! workToDoNow) {
-                long remainder = delaysBetweenEachTickMillis - Duration.between(lastTick, clock.instant()).toMillis();
+                Duration timeSinceLastConverge = Duration.between(lastTick, clock.instant());
+                long remainder = nodeAdminConvergeStateInterval.minus(timeSinceLastConverge).toMillis();
                 if (remainder > 0) {
                     try {
                         monitor.wait(remainder);
@@ -231,7 +258,7 @@ public class NodeAdminStateUpdater extends AbstractComponent {
             }
             final List<ContainerNodeSpec> containersToRun;
             try {
-                containersToRun = nodeRepository.getContainersToRun();
+                containersToRun = nodeRepository.getContainersToRun(dockerHostHostName);
             } catch (Exception e) {
                 log.log(LogLevel.WARNING, "Failed fetching container info from node repository", e);
                 return;
@@ -250,7 +277,7 @@ public class NodeAdminStateUpdater extends AbstractComponent {
 
     private List<String> getNodesInActiveState() {
         try {
-            return nodeRepository.getContainersToRun()
+            return nodeRepository.getContainersToRun(dockerHostHostName)
                                  .stream()
                                  .filter(nodespec -> nodespec.nodeState == Node.State.active)
                                  .map(nodespec -> nodespec.hostname)
@@ -260,35 +287,38 @@ public class NodeAdminStateUpdater extends AbstractComponent {
         }
     }
 
-    public void start(long stateConvergeInterval) {
-        delaysBetweenEachTickMillis = stateConvergeInterval;
-        if (loopThread != null) {
-            throw new RuntimeException("Can not restart NodeAdminStateUpdater");
-        }
-
-        loopThread = new Thread(() -> {
-            while (! terminated.get()) tick();
-        });
-        loopThread.setName("tick-NodeAdminStateUpdater");
+    public void start() {
         loopThread.start();
     }
 
-    @Override
-    public void deconstruct() {
+    public void stop() {
+        log.info(objectToString() + ": Stop called");
         if (!terminated.compareAndSet(false, true)) {
             throw new RuntimeException("Can not re-stop a node agent.");
         }
-        log.log(LogLevel.INFO, objectToString() + ": Deconstruct called");
+
+        classLocking.interrupt();
+
+        // First we need to stop NodeAdminStateUpdater thread to make sure no new NodeAgents are spawned
         signalWorkToBeDone();
-        try {
-            loopThread.join(10000);
-            if (loopThread.isAlive()) {
-                log.log(LogLevel.ERROR, "Could not stop tick thread");
+        specVerifierScheduler.shutdown();
+
+        do {
+            try {
+                loopThread.join();
+                specVerifierScheduler.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e1) {
+                log.info("Interrupted while waiting for NodeAdminStateUpdater thread and specVerfierScheduler to shutdown");
             }
-        } catch (InterruptedException e1) {
-            log.log(LogLevel.ERROR, "Interrupted; Could not stop thread");
-        }
-        nodeAdmin.shutdown();
-        log.log(LogLevel.INFO, objectToString() + ": Deconstruct complete");
+        } while (loopThread.isAlive() || !specVerifierScheduler.isTerminated());
+
+        // Finally, stop NodeAdmin and all the NodeAgents
+        nodeAdmin.stop();
+
+        classLock.ifPresent(lock -> {
+            log.info(objectToString() + ": Releasing lock");
+            lock.close();
+        });
+        log.info(objectToString() + ": Stop complete");
     }
 }

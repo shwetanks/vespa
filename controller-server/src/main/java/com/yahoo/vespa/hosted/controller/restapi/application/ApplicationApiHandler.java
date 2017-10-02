@@ -194,6 +194,7 @@ public class ApplicationApiHandler extends LoggingRequestHandler {
         Path path = new Path(request.getUri().getPath());
         if (path.matches("/application/v4/tenant/{tenant}")) return deleteTenant(path.get("tenant"), request);
         if (path.matches("/application/v4/tenant/{tenant}/application/{application}")) return deleteApplication(path.get("tenant"), path.get("application"), request);
+        if (path.matches("/application/v4/tenant/{tenant}/application/{application}/deploying")) return cancelDeploy(path.get("tenant"), path.get("application"));
         if (path.matches("/application/v4/tenant/{tenant}/application/{application}/environment/{environment}/region/{region}/instance/{instance}")) return deactivate(path.get("tenant"), path.get("application"), path.get("instance"), path.get("environment"), path.get("region"));
         if (path.matches("/application/v4/tenant/{tenant}/application/{application}/environment/{environment}/region/{region}/instance/{instance}/global-rotation/override"))
             return setGlobalRotationOverride(path.get("tenant"), path.get("application"), path.get("instance"), path.get("environment"), path.get("region"), true, request);
@@ -679,7 +680,7 @@ public class ApplicationApiHandler extends LoggingRequestHandler {
             Application application = controller.applications().require(id);
             if (application.deploying().isPresent())
                 throw new IllegalArgumentException("Can not start a deployment of " + application + " at this time: " +
-                                                   application.deploying() + " is in progress");
+                                                   application.deploying().get() + " is in progress");
 
             Version version = decideDeployVersion(request);
             if ( ! systemHasVersion(version))
@@ -687,14 +688,26 @@ public class ApplicationApiHandler extends LoggingRequestHandler {
                                                    "Version is not active in this system. " +
                                                    "Active versions: " + controller.versionStatus().versions());
 
-            // Since we manually triggered it we don't want this to be self-triggering for the time being 
-            controller.applications().store(application.with(application.deploymentJobs().asSelfTriggering(false)), lock);
-
             controller.applications().deploymentTrigger().triggerChange(application.id(), new Change.VersionChange(version));
             return new MessageResponse("Triggered deployment of " + application + " on version " + version);
         }
     }
-    
+
+    /** Cancel any ongoing change for given application */
+    private HttpResponse cancelDeploy(String tenantName, String applicationName) {
+        ApplicationId id = ApplicationId.from(tenantName, applicationName, "default");
+        try (Lock lock = controller.applications().lock(id)) {
+            Application application = controller.applications().require(id);
+            Optional<Change> change = application.deploying();
+            if (!change.isPresent()) {
+                return new MessageResponse("No deployment in progress for " + application + " at this time");
+            }
+            controller.applications().deploymentTrigger().cancelChange(id);
+            return new MessageResponse("Cancelled " + change.get() + " for " + application);
+        }
+    }
+
+    /** Schedule restart of deployment, or specific host in a deployment */
     private HttpResponse restart(String tenantName, String applicationName, String instanceName, String environment, String region, HttpRequest request) {
         DeploymentId deploymentId = new DeploymentId(ApplicationId.from(tenantName, applicationName, instanceName),
                                                      new Zone(Environment.from(environment), RegionName.from(region)));

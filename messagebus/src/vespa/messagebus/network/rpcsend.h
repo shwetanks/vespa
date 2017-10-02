@@ -19,6 +19,7 @@ class Error;
 class Route;
 class Message;
 class RPCServiceAddress;
+class IProtocol;
 
 class PayLoadFiller
 {
@@ -82,6 +83,9 @@ public:
 
     void invoke(FRT_RPCRequest *req);
 private:
+    void doRequest(FRT_RPCRequest *req);
+    void doRequestDone(FRT_RPCRequest *req);
+    void doHandleReply(const IProtocol * protocol, std::unique_ptr<Reply> reply);
     void attach(RPCNetwork &net) final override;
     void handleDiscard(Context ctx) final override;
     void sendByHandover(RoutingNode &recipient, const vespalib::Version &version,

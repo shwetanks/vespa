@@ -2,10 +2,7 @@
 package com.yahoo.vespa.hosted.controller.maintenance;
 
 import com.yahoo.component.Version;
-import com.yahoo.component.Vtag;
 import com.yahoo.config.application.api.DeploymentSpec.UpgradePolicy;
-import com.yahoo.config.provision.Environment;
-import com.yahoo.config.provision.RegionName;
 import com.yahoo.vespa.hosted.controller.Application;
 import com.yahoo.vespa.hosted.controller.Controller;
 import com.yahoo.vespa.hosted.controller.application.ApplicationList;
@@ -14,7 +11,7 @@ import com.yahoo.vespa.hosted.controller.versions.VespaVersion;
 import com.yahoo.yolean.Exceptions;
 
 import java.time.Duration;
-import java.util.Optional;
+import java.time.Instant;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -22,8 +19,11 @@ import java.util.logging.Logger;
  * Maintenance job which schedules applications for Vespa version upgrade
  * 
  * @author bratseth
+ * @author mpolden
  */
 public class Upgrader extends Maintainer {
+
+    private static final Duration upgradeTimeout = Duration.ofHours(12);
 
     private static final Logger log = Logger.getLogger(Upgrader.class.getName());
 
@@ -38,19 +38,13 @@ public class Upgrader extends Maintainer {
     public void maintain() {
         VespaVersion target = controller().versionStatus().version(controller().systemVersion());
         if (target == null) return; // we don't have information about the current system version at this time
-
-        // TODO: Remove corp-prod special casing when corp-prod and main are upgraded at the same time
-        if (Vtag.currentVersion.isAfter(target.versionNumber())) {
-            upgrade(applications().deploysTo(Environment.prod, RegionName.from("corp-us-east-1")).with(UpgradePolicy.canary),
-                    Vtag.currentVersion);
-        }
         
         switch (target.confidence()) {
             case broken:
                 ApplicationList toCancel = applications().upgradingTo(target.versionNumber())
                                                          .without(UpgradePolicy.canary);
                 if (toCancel.isEmpty()) break;
-                log.info("Version " + target.versionNumber() + " is broken, cancelling all upgrades");
+                log.info("Version " + target.versionNumber() + " is broken, cancelling upgrades of non-canaries");
                 cancelUpgradesOf(toCancel);
                 break;
             case low:
@@ -72,12 +66,14 @@ public class Upgrader extends Maintainer {
     
     private void upgrade(ApplicationList applications, Version version) {
         Change.VersionChange change = new Change.VersionChange(version);
+        Instant startOfUpgradePeriod = controller().clock().instant().minus(upgradeTimeout);
         cancelUpgradesOf(applications.upgradingToLowerThan(version));
         applications = applications.notPullRequest(); // Pull requests are deployed as separate applications to test then deleted; No need to upgrade
         applications = applications.onLowerVersionThan(version);
         applications = applications.notDeployingApplication(); // wait with applications deploying an application change
         applications = applications.notFailingOn(version); // try to upgrade only if it hasn't failed on this version
-        applications = applications.notRunningJobFor(change); // do not trigger multiple jobs simultaneously for same upgrade
+        applications = applications.notCurrentlyUpgrading(change, startOfUpgradePeriod); // do not trigger again if currently upgrading
+        applications = applications.canUpgradeAt(controller().clock().instant()); // wait with applications that are currently blocking upgrades
         for (Application application : applications.byIncreasingDeployedVersion().asList()) {
             try {
                 controller().applications().deploymentTrigger().triggerChange(application.id(), change);

@@ -47,6 +47,7 @@ public class NodeAdminImpl implements NodeAdmin {
     private final DockerOperations dockerOperations;
     private final Function<String, NodeAgent> nodeAgentFactory;
     private final StorageMaintainer storageMaintainer;
+    private final AclMaintainer aclMaintainer;
 
     private final Clock clock;
     private boolean previousWantFrozen;
@@ -55,8 +56,6 @@ public class NodeAdminImpl implements NodeAdmin {
 
     private final Map<ContainerName, NodeAgent> nodeAgents = new ConcurrentHashMap<>();
 
-    private final int nodeAgentScanIntervalMillis;
-
     private final GaugeWrapper numberOfContainersInLoadImageState;
     private final CounterWrapper numberOfUnhandledExceptionsInNodeAgent;
 
@@ -64,13 +63,12 @@ public class NodeAdminImpl implements NodeAdmin {
                          final Function<String, NodeAgent> nodeAgentFactory,
                          final StorageMaintainer storageMaintainer,
                          final AclMaintainer aclMaintainer,
-                         final int nodeAgentScanIntervalMillis,
                          final MetricReceiverWrapper metricReceiver,
                          final Clock clock) {
         this.dockerOperations = dockerOperations;
         this.nodeAgentFactory = nodeAgentFactory;
         this.storageMaintainer = storageMaintainer;
-        this.nodeAgentScanIntervalMillis = nodeAgentScanIntervalMillis;
+        this.aclMaintainer = aclMaintainer;
 
         this.clock = clock;
         this.previousWantFrozen = true;
@@ -80,18 +78,6 @@ public class NodeAdminImpl implements NodeAdmin {
         Dimensions dimensions = new Dimensions.Builder().add("role", "docker").build();
         this.numberOfContainersInLoadImageState = metricReceiver.declareGauge(MetricReceiverWrapper.APPLICATION_DOCKER, dimensions, "nodes.image.loading");
         this.numberOfUnhandledExceptionsInNodeAgent = metricReceiver.declareCounter(MetricReceiverWrapper.APPLICATION_DOCKER, dimensions, "nodes.unhandled_exceptions");
-
-        metricsScheduler.scheduleAtFixedRate(() -> {
-            try {
-                nodeAgents.values().forEach(NodeAgent::updateContainerNodeMetrics);
-            } catch (Throwable e) {
-                logger.warning("Metric fetcher scheduler failed", e);
-            }
-        }, 0, 55, TimeUnit.SECONDS);
-
-        aclScheduler.scheduleWithFixedDelay(() -> {
-            if (!isFrozen()) aclMaintainer.run();
-        }, 30, 60, TimeUnit.SECONDS);
     }
 
     @Override
@@ -183,24 +169,36 @@ public class NodeAdminImpl implements NodeAdmin {
     }
 
     @Override
-    public void shutdown() {
+    public void start() {
+        metricsScheduler.scheduleAtFixedRate(() -> {
+            try {
+                nodeAgents.values().forEach(NodeAgent::updateContainerNodeMetrics);
+            } catch (Throwable e) {
+                logger.warning("Metric fetcher scheduler failed", e);
+            }
+        }, 0, 55, TimeUnit.SECONDS);
+
+        aclScheduler.scheduleWithFixedDelay(() -> {
+            if (!isFrozen()) aclMaintainer.run();
+        }, 30, 60, TimeUnit.SECONDS);
+    }
+
+    @Override
+    public void stop() {
         metricsScheduler.shutdown();
         aclScheduler.shutdown();
-        try {
-            boolean metricsSchedulerShutdown = metricsScheduler.awaitTermination(30, TimeUnit.SECONDS);
-            boolean aclSchedulerShutdown = aclScheduler.awaitTermination(30, TimeUnit.SECONDS);
-            if (! (metricsSchedulerShutdown && aclSchedulerShutdown)) {
-                throw new RuntimeException("Failed shutting down all scheduler(s), shutdown status:\n" +
-                        "\tMetrics Scheduler: " + metricsSchedulerShutdown + "\n" +
-                        "\tACL Scheduler: " + aclSchedulerShutdown);
-            }
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }
 
-        for (NodeAgent nodeAgent : nodeAgents.values()) {
-            nodeAgent.stop();
-        }
+        // Stop all node-agents in parallel, will block until the last NodeAgent is stopped
+        nodeAgents.values().parallelStream().forEach(NodeAgent::stop);
+
+        do {
+            try {
+                metricsScheduler.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+                aclScheduler.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                logger.info("Was interrupted while waiting for metricsScheduler and aclScheduler to shutdown");
+            }
+        } while (!metricsScheduler.isTerminated() || !aclScheduler.isTerminated());
     }
 
     // Set-difference. Returns minuend minus subtrahend.
@@ -257,7 +255,7 @@ public class NodeAdminImpl implements NodeAdmin {
         }
 
         final NodeAgent agent = nodeAgentFactory.apply(hostname);
-        agent.start(nodeAgentScanIntervalMillis);
+        agent.start();
         nodeAgents.put(containerName, agent);
         try {
             Thread.sleep(1000);

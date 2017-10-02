@@ -2,11 +2,11 @@
 package com.yahoo.vespa.hosted.controller.maintenance;
 
 import com.yahoo.component.Version;
-import com.yahoo.component.Vtag;
 import com.yahoo.config.provision.Environment;
+import com.yahoo.test.ManualClock;
 import com.yahoo.vespa.hosted.controller.Application;
+import com.yahoo.vespa.hosted.controller.ControllerTester;
 import com.yahoo.vespa.hosted.controller.application.ApplicationPackage;
-import com.yahoo.vespa.hosted.controller.application.Change;
 import com.yahoo.vespa.hosted.controller.application.DeploymentJobs;
 import com.yahoo.vespa.hosted.controller.deployment.ApplicationPackageBuilder;
 import com.yahoo.vespa.hosted.controller.deployment.DeploymentTester;
@@ -14,6 +14,7 @@ import com.yahoo.vespa.hosted.controller.versions.VespaVersion;
 import org.junit.Test;
 
 import java.time.Duration;
+import java.time.Instant;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -56,7 +57,7 @@ public class UpgraderTest {
 
         assertEquals("New system version: Should upgrade Canaries", 2, tester.buildSystem().jobs().size());
         tester.completeUpgrade(canary0, version, "canary");
-        assertEquals(version, tester.configServerClientMock().lastPrepareVersion.get());
+        assertEquals(version, tester.configServer().lastPrepareVersion().get());
 
         tester.updateVersionStatus(version);
         tester.upgrader().maintain();
@@ -106,7 +107,7 @@ public class UpgraderTest {
 
         assertEquals("New system version: Should upgrade Canaries", 2, tester.buildSystem().jobs().size());
         tester.completeUpgrade(canary0, version, "canary");
-        assertEquals(version, tester.configServerClientMock().lastPrepareVersion.get());
+        assertEquals(version, tester.configServer().lastPrepareVersion().get());
 
         tester.updateVersionStatus(version);
         tester.upgrader().maintain();
@@ -186,7 +187,7 @@ public class UpgraderTest {
 
         assertEquals("New system version: Should upgrade Canaries", 2, tester.buildSystem().jobs().size());
         tester.completeUpgrade(canary0, version, "canary");
-        assertEquals(version, tester.configServerClientMock().lastPrepareVersion.get());
+        assertEquals(version, tester.configServer().lastPrepareVersion().get());
 
         tester.updateVersionStatus(version);
         tester.upgrader().maintain();
@@ -362,39 +363,107 @@ public class UpgraderTest {
         assertEquals(VespaVersion.Confidence.normal, tester.controller().versionStatus().systemVersion().get().confidence());
     }
 
-    // TODO: Remove when corp-prod special casing is no longer needed
     @Test
-    public void upgradesCanariesToControllerVersion() {
-        DeploymentTester tester = new DeploymentTester();
+    public void testConsidersBlockUpgradeWindow() {
+        ManualClock clock = new ManualClock(Instant.parse("2017-09-26T18:00:00.00Z")); // A tuesday
+        DeploymentTester tester = new DeploymentTester(new ControllerTester(clock));
+        Version version = Version.fromString("5.0");
+        tester.updateVersionStatus(version);
+
         ApplicationPackage applicationPackage = new ApplicationPackageBuilder()
                 .upgradePolicy("canary")
-                .environment(Environment.prod)
-                .region("corp-us-east-1")
+                // Block upgrades on tuesday in hours 18 and 19
+                .blockUpgrade("tue", "18-19", "UTC")
+                .region("us-west-1")
                 .build();
 
-        Version version = Version.fromString("5.0"); // Lower version than controller (6.10)
-        tester.updateVersionStatus(version);
+        Application app = tester.createAndDeploy("app1", 1, applicationPackage);
 
-        // Application is on 5.0
-        Application app = tester.createApplication("app1", "tenant1", 1, 11L);
-        tester.notifyJobCompletion(DeploymentJobs.JobType.component, app, true);
-        tester.deployAndNotify(app, applicationPackage, true, DeploymentJobs.JobType.systemTest);
-        tester.deployAndNotify(app, applicationPackage, true, DeploymentJobs.JobType.stagingTest);
-        tester.deployAndNotify(app, applicationPackage, true, DeploymentJobs.JobType.productionCorpUsEast1);
-
-        // Canary in prod.corp-us-east-1 is upgraded to controller version
-        tester.upgrader().maintain();
-        assertEquals("Upgrade started", 1, tester.buildSystem().jobs().size());
-        assertEquals(Vtag.currentVersion, ((Change.VersionChange) tester.application(app.id()).deploying().get()).version());
-        tester.deployAndNotify(app, applicationPackage, true, DeploymentJobs.JobType.systemTest);
-        tester.deployAndNotify(app, applicationPackage, true, DeploymentJobs.JobType.stagingTest);
-        tester.deployAndNotify(app, applicationPackage, true, DeploymentJobs.JobType.productionCorpUsEast1);
-
-        // System is upgraded to newer version, no upgrade triggered for canary as version is lower than controller
+        // New version is released
         version = Version.fromString("5.1");
         tester.updateVersionStatus(version);
+
+        // Application is not upgraded at this time
         tester.upgrader().maintain();
-        assertTrue("No more jobs triggered", tester.buildSystem().jobs().isEmpty());
+        assertTrue("No jobs scheduled", tester.buildSystem().jobs().isEmpty());
+
+        // One hour passes, time is 19:00, still no upgrade
+        tester.clock().advance(Duration.ofHours(1));
+        tester.upgrader().maintain();
+        assertTrue("No jobs scheduled", tester.buildSystem().jobs().isEmpty());
+
+        // Two hours pass in total, time is 20:00 and application upgrades
+        tester.clock().advance(Duration.ofHours(1));
+        tester.upgrader().maintain();
+        assertFalse("Job is scheduled", tester.buildSystem().jobs().isEmpty());
+        tester.completeUpgrade(app, version, "canary");
+        assertTrue("All jobs consumed", tester.buildSystem().jobs().isEmpty());
+    }
+
+    @Test
+    public void testReschedulesUpgradeAfterTimeout() {
+        DeploymentTester tester = new DeploymentTester();
+        Version version = Version.fromString("5.0");
+        tester.updateVersionStatus(version);
+
+        ApplicationPackage applicationPackage = new ApplicationPackageBuilder()
+                .environment(Environment.prod)
+                .region("us-west-1")
+                .build();
+
+        // Setup applications
+        Application canary0 = tester.createAndDeploy("canary0", 0, "canary");
+        Application canary1 = tester.createAndDeploy("canary1", 1, "canary");
+        Application default0 = tester.createAndDeploy("default0", 2, "default");
+        Application default1 = tester.createAndDeploy("default1", 3, "default");
+        Application default2 = tester.createAndDeploy("default2", 4, "default");
+        Application default3 = tester.createAndDeploy("default3", 5, "default");
+        Application default4 = tester.createAndDeploy("default4", 6, "default");
+
+        // New version is released
+        version = Version.fromString("5.1");
+        tester.updateVersionStatus(version);
+        assertEquals(version, tester.controller().versionStatus().systemVersion().get().versionNumber());
+        tester.upgrader().maintain();
+
+        // Canaries upgrade and raise confidence
+        tester.completeUpgrade(canary0, version, "canary");
+        tester.completeUpgrade(canary1, version, "canary");
+        tester.updateVersionStatus(version);
+        assertEquals(VespaVersion.Confidence.normal, tester.controller().versionStatus().systemVersion().get().confidence());
+
+        // Applications with default policy start upgrading
+        tester.clock().advance(Duration.ofMinutes(1));
+        tester.upgrader().maintain();
+        assertEquals("Upgrade scheduled for remaining apps", 5, tester.buildSystem().jobs().size());
+
+        // 4/5 applications fail, confidence is lowered and upgrade is cancelled
+        tester.completeUpgradeWithError(default0, version, "default", DeploymentJobs.JobType.systemTest);
+        tester.completeUpgradeWithError(default1, version, "default", DeploymentJobs.JobType.systemTest);
+        tester.completeUpgradeWithError(default2, version, "default", DeploymentJobs.JobType.systemTest);
+        tester.completeUpgradeWithError(default3, version, "default", DeploymentJobs.JobType.systemTest);
+        tester.updateVersionStatus(version);
+        assertEquals(VespaVersion.Confidence.broken, tester.controller().versionStatus().systemVersion().get().confidence());
+        tester.upgrader().maintain();
+
+        // 5th app never reports back and has a dead locked job, but no ongoing change
+        Application deadLocked = tester.applications().require(default4.id());
+        assertTrue("Jobs in progress", deadLocked.deploymentJobs().inProgress());
+        assertFalse("No change present", deadLocked.deploying().isPresent());
+
+        // 4/5 applications are repaired and confidence is restored
+        tester.deployCompletely(default0, applicationPackage);
+        tester.deployCompletely(default1, applicationPackage);
+        tester.deployCompletely(default2, applicationPackage);
+        tester.deployCompletely(default3, applicationPackage);
+        tester.updateVersionStatus(version);
+        assertEquals(VespaVersion.Confidence.normal, tester.controller().versionStatus().systemVersion().get().confidence());
+
+        // Over 12 hours pass and upgrade is rescheduled for 5th app
+        tester.clock().advance(Duration.ofHours(12).plus(Duration.ofSeconds(1)));
+        tester.upgrader().maintain();
+        assertEquals("Upgrade is rescheduled", DeploymentJobs.JobType.systemTest.id(),
+                     tester.buildSystem().jobs().get(0).jobName());
     }
 
 }

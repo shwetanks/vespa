@@ -5,15 +5,12 @@ import com.google.common.collect.ImmutableList;
 import com.yahoo.component.Version;
 import com.yahoo.config.application.api.DeploymentSpec.UpgradePolicy;
 import com.yahoo.config.provision.ApplicationId;
-import com.yahoo.config.provision.Environment;
-import com.yahoo.config.provision.RegionName;
 import com.yahoo.vespa.hosted.controller.Application;
 import com.yahoo.vespa.hosted.controller.ApplicationController;
 
 import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Optional;
 import java.util.stream.Stream;
 
 /**
@@ -114,6 +111,11 @@ public class ApplicationList {
         return listOf(list.stream().filter(a -> ! a.id().instance().value().startsWith("default-pr")));
     }
 
+    /** Returns the subset of applications that are allowed to upgrade at the given time */
+    public ApplicationList canUpgradeAt(Instant instant) {
+        return listOf(list.stream().filter(a -> a.deploymentSpec().canUpgradeAt(instant)));
+    }
+
      // ----------------------------------- Sorting
 
     /**
@@ -125,17 +127,12 @@ public class ApplicationList {
         return listOf(list.stream().sorted(Comparator.comparing(application -> application.deployedVersion().orElse(Version.emptyVersion))));
     }
 
-    /** Returns the subset of applications which currently do not have any job in progress for the given change */
-    public ApplicationList notRunningJobFor(Change.VersionChange change) {
-        return listOf(list.stream().filter(a -> !hasRunningJob(a, change)));
+    /** Returns the subset of applications that are not upgrading or started upgrading before the grace period */
+    public ApplicationList notCurrentlyUpgrading(Change.VersionChange change, Instant startOfGracePeriod) {
+        return listOf(list.stream().filter(a -> !currentlyUpgrading(change, a, startOfGracePeriod)));
     }
 
-    /** Returns the subset of applications which deploys to given environment and region */
-    public ApplicationList deploysTo(Environment environment, RegionName region) {
-        return listOf(list.stream().filter(a -> a.deploymentSpec().includes(environment, Optional.of(region))));
-    }
-
-    // ----------------------------------- Internal helpers 
+    // ----------------------------------- Internal helpers
     
     private static boolean isUpgradingTo(Version version, Application application) {
         if ( ! (application.deploying().isPresent()) ) return false;
@@ -160,11 +157,12 @@ public class ApplicationList {
         return false;
     }
 
-    private static boolean hasRunningJob(Application application, Change.VersionChange change) {
+    private static boolean currentlyUpgrading(Change.VersionChange change, Application application, Instant instant) {
         return application.deploymentJobs().jobStatus().values().stream()
                 .filter(JobStatus::inProgress)
-                .filter(jobStatus -> jobStatus.lastTriggered().isPresent())
-                .map(jobStatus -> jobStatus.lastTriggered().get())
+                .filter(status -> status.lastTriggered().isPresent())
+                .map(status -> status.lastTriggered().get())
+                .filter(jobRun -> jobRun.at().isAfter(instant))
                 .anyMatch(jobRun -> jobRun.version().equals(change.version()));
     }
     

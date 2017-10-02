@@ -8,13 +8,13 @@
 #include "storeonlyfeedview.h"
 #include "updatedonecontext.h"
 #include "remove_batch_done_context.h"
-#include <vespa/document/datatype/documenttype.h>
 #include <vespa/searchcore/proton/common/commit_time_tracker.h>
 #include <vespa/searchcore/proton/common/feedtoken.h>
 #include <vespa/searchcore/proton/documentmetastore/ilidreusedelayer.h>
 #include <vespa/searchcore/proton/metrics/feed_metrics.h>
 #include <vespa/searchcore/proton/reference/i_gid_to_lid_change_handler.h>
-#include <vespa/searchlib/common/scheduletaskcallback.h>
+#include <vespa/document/datatype/documenttype.h>
+#include <vespa/document/fieldvalue/document.h>
 #include <vespa/vespalib/util/exceptions.h>
 
 #include <vespa/log/log.h>
@@ -26,7 +26,7 @@ using document::DocumentId;
 using document::DocumentTypeRepo;
 using document::DocumentUpdate;
 using search::index::Schema;
-using search::makeLambdaTask;
+using vespalib::makeLambdaTask;
 using search::IDestructorCallback;
 using search::SerialNum;
 using storage::spi::BucketInfoResult;

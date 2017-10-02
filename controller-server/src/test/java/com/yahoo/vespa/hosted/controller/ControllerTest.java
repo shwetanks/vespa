@@ -17,16 +17,10 @@ import com.yahoo.vespa.curator.Lock;
 import com.yahoo.vespa.hosted.controller.api.Tenant;
 import com.yahoo.vespa.hosted.controller.api.application.v4.model.DeployOptions;
 import com.yahoo.vespa.hosted.controller.api.application.v4.model.EndpointStatus;
-import com.yahoo.vespa.hosted.controller.api.application.v4.model.GitRevision;
-import com.yahoo.vespa.hosted.controller.api.application.v4.model.ScrewdriverBuildJob;
 import com.yahoo.vespa.hosted.controller.api.identifiers.AthensDomain;
 import com.yahoo.vespa.hosted.controller.api.identifiers.DeploymentId;
-import com.yahoo.vespa.hosted.controller.api.identifiers.GitBranch;
-import com.yahoo.vespa.hosted.controller.api.identifiers.GitCommit;
-import com.yahoo.vespa.hosted.controller.api.identifiers.GitRepository;
 import com.yahoo.vespa.hosted.controller.api.identifiers.Property;
 import com.yahoo.vespa.hosted.controller.api.identifiers.PropertyId;
-import com.yahoo.vespa.hosted.controller.api.identifiers.ScrewdriverId;
 import com.yahoo.vespa.hosted.controller.api.identifiers.TenantId;
 import com.yahoo.vespa.hosted.controller.api.identifiers.UserGroup;
 import com.yahoo.vespa.hosted.controller.api.integration.BuildService.BuildJob;
@@ -101,7 +95,7 @@ public class ControllerTest {
         // staging job - succeeding
         Version version1 = Version.fromString("6.1"); // Set in config server mock
         Application app1 = tester.createApplication("app1", "tenant1", 1, 11L);
-        applications.notifyJobCompletion(mockReport(app1, component, true, false));
+        applications.notifyJobCompletion(mockReport(app1, component, true));
         assertFalse("Revision is currently not known",
                     ((Change.ApplicationChange)tester.controller().applications().require(app1.id()).deploying().get()).revision().isPresent());
         tester.deployAndNotify(app1, applicationPackage, true, systemTest);
@@ -143,7 +137,7 @@ public class ControllerTest {
         tester.clock().advance(Duration.ofSeconds(1));
 
         // system and staging test job - succeeding
-        applications.notifyJobCompletion(mockReport(app1, component, true, false));
+        applications.notifyJobCompletion(mockReport(app1, component, true));
         tester.deployAndNotify(app1, applicationPackage, true, systemTest);
         assertStatus(JobStatus.initial(systemTest)
                               .withTriggering(version1, revision, false, tester.clock().instant())
@@ -170,7 +164,7 @@ public class ControllerTest {
                 .environment(Environment.prod)
                 .region("us-east-3")
                 .build();
-        applications.notifyJobCompletion(mockReport(app1, component, true, false));
+        applications.notifyJobCompletion(mockReport(app1, component, true));
         try {
             tester.deploy(systemTest, app1, applicationPackage);
             fail("Expected exception due to unallowed production deployment removal");
@@ -207,17 +201,16 @@ public class ControllerTest {
         Version systemVersion = tester.controller().versionStatus().systemVersion().get().versionNumber();
 
         Application app1 = tester.createApplication("application1", "tenant1", 1, 1L);
-        applications.store(app1.with(app1.deploymentJobs().asSelfTriggering(false)), applications.lock(app1.id()));
 
         // First deployment: An application change
-        applications.notifyJobCompletion(mockReport(app1, component, true, false));
+        applications.notifyJobCompletion(mockReport(app1, component, true));
         tester.deployAndNotify(app1, applicationPackage, true, systemTest);
         tester.deployAndNotify(app1, applicationPackage, true, stagingTest);
         tester.deployAndNotify(app1, applicationPackage, true, productionUsWest1);
 
         app1 = applications.require(app1.id());
         assertEquals("First deployment gets system version", systemVersion, app1.deployedVersion().get());
-        assertEquals(systemVersion, tester.configServerClientMock().lastPrepareVersion.get());
+        assertEquals(systemVersion, tester.configServer().lastPrepareVersion().get());
 
         // Unexpected deployment
         tester.deploy(productionUsWest1, app1, applicationPackage);
@@ -233,25 +226,21 @@ public class ControllerTest {
                 .region("us-west-1")
                 .region("us-east-3")
                 .build();
-        applications.notifyJobCompletion(mockReport(app1, component, true, false));
+        applications.notifyJobCompletion(mockReport(app1, component, true));
         tester.deployAndNotify(app1, applicationPackage, true, systemTest);
         tester.deployAndNotify(app1, applicationPackage, true, stagingTest);
         tester.deployAndNotify(app1, applicationPackage, true, productionUsWest1);
 
         app1 = applications.require(app1.id());
         assertEquals("Application change preserves version", systemVersion, app1.deployedVersion().get());
-        assertEquals(systemVersion, tester.configServerClientMock().lastPrepareVersion.get());
+        assertEquals(systemVersion, tester.configServer().lastPrepareVersion().get());
 
         // A deployment to the new region gets the same version
-        applicationPackage = new ApplicationPackageBuilder()
-                .environment(Environment.prod)
-                .region("us-west-1")
-                .region("us-east-3")
-                .build();
         tester.deployAndNotify(app1, applicationPackage, true, productionUsEast3);
         app1 = applications.require(app1.id());
         assertEquals("Application change preserves version", systemVersion, app1.deployedVersion().get());
-        assertEquals(systemVersion, tester.configServerClientMock().lastPrepareVersion.get());
+        assertEquals(systemVersion, tester.configServer().lastPrepareVersion().get());
+        assertFalse("Change deployed", app1.deploying().isPresent());
 
         // Version upgrade changes system version
         Change.VersionChange change = new Change.VersionChange(newSystemVersion);
@@ -263,7 +252,7 @@ public class ControllerTest {
 
         app1 = applications.require(app1.id());
         assertEquals("Version upgrade changes version", newSystemVersion, app1.deployedVersion().get());
-        assertEquals(newSystemVersion, tester.configServerClientMock().lastPrepareVersion.get());
+        assertEquals(newSystemVersion, tester.configServer().lastPrepareVersion().get());
     }
 
     /** Adds a new version, higher than the current system version, makes it the system version and returns it */
@@ -404,23 +393,6 @@ public class ControllerTest {
     }
 
     @Test
-    public void selfTriggeringApplicationIsNotTriggered() {
-        ControllerTester tester = new ControllerTester();
-        ApplicationController applications = tester.controller().applications();
-
-        // Create application and report completion from component job
-        long projectId = 1;
-        TenantId tenant = tester.createTenant("tenant", "domain", 1L);
-        Application application = tester.createApplication(tenant, "application", "default", projectId);
-        applications.notifyJobCompletion(mockReport(application, component, true, true));
-
-        // Only component completion status is persisted and no further jobs are triggered
-        assertEquals(1, applications.get(application.id()).get().deploymentJobs().jobStatus().size());
-        assertStatus(JobStatus.initial(component).withCompletion(Optional.empty(), tester.clock().instant(), tester.controller()),
-                     application.id(), tester.controller());
-    }
-
-    @Test
     public void requeueOutOfCapacityStagingJob() {
         DeploymentTester tester = new DeploymentTester();
 
@@ -491,19 +463,18 @@ public class ControllerTest {
         assertEquals(expectedStatus, existingStatus);
     }
 
-    private JobReport mockReport(Application application, JobType jobType, Optional<JobError> jobError, boolean selfTriggering) {
+    private JobReport mockReport(Application application, JobType jobType, Optional<JobError> jobError) {
         return new JobReport(
                 application.id(),
                 jobType,
                 application.deploymentJobs().projectId().get(),
                 42,
-                jobError,
-                selfTriggering
+                jobError
         );
     }
 
-    private JobReport mockReport(Application application, JobType jobType, boolean success, boolean selfTriggering) {
-        return mockReport(application, jobType, JobError.from(success), selfTriggering);
+    private JobReport mockReport(Application application, JobType jobType, boolean success) {
+        return mockReport(application, jobType, JobError.from(success));
     }
 
     @Test
@@ -533,51 +504,12 @@ public class ControllerTest {
     }
 
     @Test
-    public void testLegacyDeployments() {
-        // Setup system
-        DeploymentTester tester = new DeploymentTester();
-        ApplicationController applications = tester.controller().applications();
-        ApplicationPackage applicationPackage = new ApplicationPackageBuilder()
-                .environment(Environment.prod)
-                .region("us-east-3")
-                .build();
-        Version systemVersion = tester.controller().versionStatus().systemVersion().get().versionNumber();
-
-        Application app1 = tester.createApplication("application1", "tenant1", 1, 1L);
-        applications.store(app1.with(app1.deploymentJobs().asSelfTriggering(true)), applications.lock(app1.id()));
-
-        // Scenario: App already on 6.0, Upgrade to 6.1 (systemversion)
-        Zone prodZone = new Zone(Environment.prod, RegionName.from("us-east-3"));
-        Zone stagingZone = new Zone(Environment.staging, RegionName.from("us-east-3"));
-        Version existingVersion = Version.fromString("6.0");
-
-        // Add deployment on existing version
-        legacyDeploy(tester.controller(), app1, applicationPackage, prodZone, Optional.of(existingVersion), false);
-
-        // Add dev/perf deployment on old version to verify that this does not affect Initialize staging step. VESPA-8469
-        Version devVersion = Version.fromString("5.0");
-        legacyDeploy(tester.controller(), app1, applicationPackage, new Zone(Environment.dev, RegionName.from("us-east-1")), Optional.of(devVersion), false);
-        legacyDeploy(tester.controller(), app1, applicationPackage, new Zone(Environment.perf, RegionName.from("us-east-3")), Optional.of(devVersion), false);
-
-        // Initialize staging on existing version
-        legacyDeploy(tester.controller(), app1, applicationPackage, stagingZone, Optional.of(systemVersion), true);
-        app1 = applications.require(app1.id());
-        assertEquals(existingVersion, app1.currentDeployVersion(tester.controller(), stagingZone));
-
-        // Upgrade to the new version in staging
-        legacyDeploy(tester.controller(), app1, applicationPackage, stagingZone, Optional.of(systemVersion), false);
-        app1 = applications.require(app1.id());
-        assertEquals(systemVersion, app1.currentDeployVersion(tester.controller(), stagingZone));
-    }
-
-    @Test
     public void testDeployUntestedChangeFails() {
         ControllerTester tester = new ControllerTester();
         ApplicationController applications = tester.controller().applications();TenantId tenant = tester.createTenant("tenant1", "domain1", 11L);
         Application app = tester.createApplication(tenant, "app1", "default", 1);
 
-        app = app.withDeploying(Optional.of(new Change.VersionChange(Version.fromString("6.3"))))
-                .with(app.deploymentJobs().asSelfTriggering(false));
+        app = app.withDeploying(Optional.of(new Change.VersionChange(Version.fromString("6.3"))));
         applications.store(app, applications.lock(app.id()));
         try {
             tester.deploy(app, new Zone(Environment.prod, RegionName.from("us-east-3")));
@@ -587,27 +519,17 @@ public class ControllerTest {
         }
     }
 
-    private void legacyDeploy(Controller controller, Application application, ApplicationPackage applicationPackage, Zone zone, Optional<Version> version, boolean deployCurrentVersion) {
-        ScrewdriverId app1ScrewdriverId = new ScrewdriverId(String.valueOf(application.deploymentJobs().projectId().get()));
-        GitRevision app1RevisionId = new GitRevision(new GitRepository("repo"), new GitBranch("master"), new GitCommit("commit1"));
-        controller.applications().deployApplication(application.id(),
-                zone,
-                applicationPackage,
-                new DeployOptions(Optional.of(new ScrewdriverBuildJob(app1ScrewdriverId, app1RevisionId)), version, false, deployCurrentVersion));
-
-    }
-
     @Test
     public void testCleanupOfStaleDeploymentData() throws IOException {
         DeploymentTester tester = new DeploymentTester();
-        tester.controllerTester().getZoneRegistryMock().setSystem(SystemName.cd);
+        tester.controllerTester().zoneRegistry().setSystem(SystemName.cd);
 
         Supplier<Map<JobType, JobStatus>> statuses = () ->
                 tester.application(ApplicationId.from("vespa", "canary", "default")).deploymentJobs().jobStatus();
 
         // Current system version, matches version in test data
         Version version = Version.fromString("6.141.117");
-        tester.configServerClientMock().setDefaultConfigServerVersion(version);
+        tester.configServer().setDefaultConfigServerVersion(version);
         tester.updateVersionStatus(version);
         assertEquals(version, tester.controller().versionStatus().systemVersion().get().versionNumber());
 
@@ -637,7 +559,7 @@ public class ControllerTest {
 
         // New version is released
         version = Version.fromString("6.142.1");
-        tester.configServerClientMock().setDefaultConfigServerVersion(version);
+        tester.configServer().setDefaultConfigServerVersion(version);
         tester.updateVersionStatus(version);
         assertEquals(version, tester.controller().versionStatus().systemVersion().get().versionNumber());
         tester.upgrader().maintain();
@@ -677,6 +599,33 @@ public class ControllerTest {
         assertTrue(record.isPresent());
         assertEquals("app1.tenant1.global.vespa.yahooapis.com", record.get().name());
         assertEquals("fake-global-rotation-tenant1.app1", record.get().value());
+    }
+
+    @Test
+    public void testDeployWithoutProjectId() {
+        DeploymentTester tester = new DeploymentTester();
+        tester.controllerTester().zoneRegistry().setSystem(SystemName.cd);
+        ApplicationPackage applicationPackage = new ApplicationPackageBuilder()
+                .environment(Environment.prod)
+                .region("cd-us-central-1")
+                .build();
+
+        // Create application
+        Application app = tester.createApplication("app1", "tenant1", 1, 2L);
+
+        // Direct deploy is allowed when project ID is missing
+        Zone zone = new Zone(Environment.prod, RegionName.from("cd-us-central-1"));
+        // Same options as used in our integration tests
+        DeployOptions options = new DeployOptions(Optional.empty(), Optional.empty(), false,
+                                                  false);
+        tester.controller().applications().deployApplication(app.id(), zone, applicationPackage, options);
+
+        assertTrue("Application deployed and activated",
+                   tester.controllerTester().configServer().activated().getOrDefault(app.id(), false));
+
+        assertTrue("No job status added",
+                   tester.applications().require(app.id()).deploymentJobs().jobStatus().isEmpty());
+
     }
 
 }
